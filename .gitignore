@@ -1,0 +1,27 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 本地功能测试区
+/playground/
+
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+/config.local.json
+/.locale-forge/
+
+# 编辑器与操作系统文件
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志、覆盖率与运行时临时文件
+*.log
+*.profraw
+/coverage/
+/tarpaulin-report.html
+/cobertura.xml
+.locale-forge-*
