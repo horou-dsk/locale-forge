@@ -1,6 +1,6 @@
 use std::{
     fs,
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -11,7 +11,10 @@ use locale_forge::{
 };
 use predicates::prelude::*;
 use serde_json::{Value, json};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+use wiremock::{
+    Mock, MockServer, Request, Respond, ResponseTemplate,
+    matchers::{header, method, path},
+};
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_locale-forge"))
@@ -136,6 +139,206 @@ fn translate_writes_target_specific_output() {
         serde_json::from_slice(&fs::read(locales.join("ja.json")).unwrap()).unwrap();
     assert_eq!(target, json!({}));
     assert!(!locales.join("ja-JP.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_available_lists_remote_models_as_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "z-model", "owned_by": "provider"},
+                {"id": "a-model"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let model_store_path = directory.path().join("models.json");
+    let mut model_store = ModelStore::default();
+    model_store
+        .set(
+            "test".into(),
+            format!("{}/v1/chat/completions", server.uri()),
+            "old-model".into(),
+            Some("secret".into()),
+        )
+        .unwrap();
+    model_store.save(&model_store_path).unwrap();
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["model", "available", "test", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a-model"))
+        .stdout(predicate::str::contains("provider"))
+        .stdout(predicate::str::contains("secret").not());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_select_validates_remote_id_before_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "new-model"}]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let model_store_path = directory.path().join("models.json");
+    let url = format!("{}/v1/chat/completions", server.uri());
+    let mut model_store = ModelStore::default();
+    model_store
+        .set(
+            "test".into(),
+            url.clone(),
+            "old-model".into(),
+            Some("secret".into()),
+        )
+        .unwrap();
+    model_store.save(&model_store_path).unwrap();
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["model", "select", "test", "missing-model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("远程模型列表中不存在"));
+    assert_eq!(
+        ModelStore::load(&model_store_path)
+            .unwrap()
+            .summary("test")
+            .unwrap()
+            .model,
+        "old-model"
+    );
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["model", "select", "test", "new-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("new-model"))
+        .stdout(predicate::str::contains("secret").not());
+    let model_store = ModelStore::load(&model_store_path).unwrap();
+    let summary = model_store.summary("test").unwrap();
+    assert_eq!(summary.url, url);
+    assert_eq!(summary.model, "new-model");
+    assert!(summary.has_key);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_select_requires_id_outside_interactive_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "new-model"}]
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let model_store_path = directory.path().join("models.json");
+    let mut model_store = ModelStore::default();
+    model_store
+        .set(
+            "test".into(),
+            format!("{}/v1/chat/completions", server.uri()),
+            "old-model".into(),
+            None,
+        )
+        .unwrap();
+    model_store.save(&model_store_path).unwrap();
+    let mut command = binary();
+    command.stdin(Stdio::null());
+
+    command
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["model", "select", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("非交互环境必须指定模型 ID"));
+    assert_eq!(
+        ModelStore::load(&model_store_path)
+            .unwrap()
+            .summary("test")
+            .unwrap()
+            .model,
+        "old-model"
+    );
+}
+
+#[test]
+fn model_activate_updates_only_existing_project_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+    let original = fs::read(&config_path).unwrap();
+    let model_store_path = directory.path().join("models.json");
+    let mut model_store = ModelStore::default();
+    model_store
+        .set(
+            "other".into(),
+            "https://example.com/v1/chat/completions".into(),
+            "example-model".into(),
+            None,
+        )
+        .unwrap();
+    model_store.save(&model_store_path).unwrap();
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "model",
+            "activate",
+            "missing",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("模型配置不存在"));
+    assert_eq!(fs::read(&config_path).unwrap(), original);
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "model",
+            "activate",
+            "other",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已将项目配置切换"));
+    let activated = fs::read(&config_path).unwrap();
+    let config: ProjectConfig = serde_json::from_slice(&activated).unwrap();
+    assert_eq!(config.model, "other");
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "model",
+            "activate",
+            "other",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已使用模型配置"));
+    assert_eq!(fs::read(&config_path).unwrap(), activated);
 }
 
 struct FirstSuccessThenFailure {

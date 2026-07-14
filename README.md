@@ -9,6 +9,7 @@ Locale Forge 是一个 Rust 命令行翻译工具。它读取一个 JSON 或 Flu
 - 支持 ARB 元数据、占位符、ICU 复数及 `select` 表达式校验。
 - 每个目标语言独立原子写入；单个语言失败不会破坏原文件。
 - 模型 URL、名称和密钥保存在用户级命名配置中。
+- 可从 OpenAI 兼容接口查询模型列表并快速切换远程模型或项目模型配置。
 
 ## 构建
 
@@ -42,6 +43,23 @@ locale-forge model set default `
 未指定密钥参数时会隐藏输入。自动化环境可使用 `--key-stdin`；本地无鉴权模型可使用 `--no-key`。`--key <值>` 虽受支持，但可能将密钥暴露在 shell 历史中。
 
 Linux、macOS 和 Windows 均将模型配置保存在用户主目录下的 `~/.locale-forge/models.json`。目录会在首次保存模型配置时自动创建。
+
+查询并切换模型：
+
+```powershell
+# 查询 default 配置对应接口提供的模型
+locale-forge model available default
+locale-forge model available default --json
+
+# 精确校验模型 ID 后切换；省略 ID 时进入编号选择
+locale-forge model select default gpt-5.5
+locale-forge model select default
+
+# 将当前项目的 config.json 切换到 default 命名配置
+locale-forge --config config.json model activate default
+```
+
+`available` 和 `select` 默认从 Chat Completions 地址推导同源 `/models` 地址；非标准接口可通过 `--url <同源地址>` 临时覆盖。`model list` 仍只列出本地命名配置，`select` 只更新该配置的远程模型 ID，`activate` 只更新项目配置的 `model` 字段。
 
 检查并执行翻译：
 

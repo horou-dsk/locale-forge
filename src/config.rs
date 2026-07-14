@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unic_langid::LanguageIdentifier;
 
+use crate::atomic_file;
+
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,22 +70,7 @@ pub struct LoadedProjectConfig {
 
 impl LoadedProjectConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let config_path = absolute_path(path)?;
-        let metadata = fs::metadata(&config_path).map_err(|source| ConfigError::Read {
-            path: config_path.clone(),
-            source,
-        })?;
-        if metadata.len() > MAX_CONFIG_SIZE {
-            return Err(ConfigError::Invalid(format!(
-                "配置文件超过 {} 字节限制",
-                MAX_CONFIG_SIZE
-            )));
-        }
-
-        let contents = fs::read_to_string(&config_path).map_err(|source| ConfigError::Read {
-            path: config_path.clone(),
-            source,
-        })?;
+        let (config_path, contents) = read_project_config(path)?;
         let config: ProjectConfig =
             serde_json::from_str(&contents).map_err(|source| ConfigError::Parse {
                 path: config_path.clone(),
@@ -214,6 +201,65 @@ pub fn write_new_project_config(path: &Path, config: &ProjectConfig) -> Result<(
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// 原子更新项目配置引用的命名模型配置；值未变化时不写文件。
+pub(crate) fn update_project_model(path: &Path, model: String) -> Result<bool, ConfigError> {
+    let (config_path, contents) = read_project_config(path)?;
+    let mut config: ProjectConfig =
+        serde_json::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: config_path.clone(),
+            source,
+        })?;
+    let base_dir = config_path
+        .parent()
+        .expect("absolute configuration path always has a parent");
+    validate_project_config(&config, base_dir)?;
+    if config.model == model {
+        return Ok(false);
+    }
+    config.model = model;
+    validate_project_config(&config, base_dir)?;
+
+    let mut document: serde_json::Value =
+        serde_json::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: config_path.clone(),
+            source,
+        })?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| ConfigError::Invalid("配置根节点必须是对象".into()))?;
+    object.insert(
+        "model".into(),
+        serde_json::Value::String(std::mem::take(&mut config.model)),
+    );
+    let mut output =
+        serde_json::to_vec_pretty(&document).map_err(|source| ConfigError::Serialize { source })?;
+    output.push(b'\n');
+    atomic_file::write(&config_path, &output, false).map_err(|source| ConfigError::Write {
+        path: config_path,
+        source,
+    })?;
+    Ok(true)
+}
+
+fn read_project_config(path: &Path) -> Result<(PathBuf, String), ConfigError> {
+    let config_path = absolute_path(path)?;
+    let metadata = fs::metadata(&config_path).map_err(|source| ConfigError::Read {
+        path: config_path.clone(),
+        source,
+    })?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        return Err(ConfigError::Invalid(format!(
+            "配置文件超过 {} 字节限制",
+            MAX_CONFIG_SIZE
+        )));
+    }
+    let contents = fs::read_to_string(&config_path).map_err(|source| ConfigError::Read {
+        path: config_path.clone(),
+        source,
+    })?;
+    Ok((config_path, contents))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -456,5 +502,25 @@ mod tests {
         let error = validate_project_config(&config, Path::new(".")).unwrap_err();
 
         assert!(error.to_string().contains("同一路径"));
+    }
+
+    #[test]
+    fn updates_project_model_and_skips_existing_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let mut document = serde_json::to_value(valid_config()).unwrap();
+        document["extension"] = serde_json::json!({"preserve": true});
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        assert!(update_project_model(&path, "new-profile".into()).unwrap());
+        let contents_after_update = fs::read(&path).unwrap();
+        let updated: ProjectConfig = serde_json::from_slice(&contents_after_update).unwrap();
+        assert_eq!(updated.model, "new-profile");
+        let updated_document: serde_json::Value =
+            serde_json::from_slice(&contents_after_update).unwrap();
+        assert_eq!(updated_document["extension"]["preserve"], true);
+
+        assert!(!update_project_model(&path, "new-profile".into()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), contents_after_update);
     }
 }

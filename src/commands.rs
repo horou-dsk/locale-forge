@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal, Read, Write},
     path::Path,
 };
 
@@ -14,9 +14,13 @@ use crate::{
     cli::{Cli, Command, DiffArgs, InitArgs, ModelCommand, ModelSetArgs, TranslateArgs},
     config::{
         LoadedProjectConfig, ProjectConfig, SourceConfig, TargetConfig, TranslationConfig,
-        write_new_project_config,
+        update_project_model, write_new_project_config,
     },
-    models::{ModelStore, ModelSummary, default_model_store_path},
+    models::{
+        ModelStore, ModelSummary, default_model_store_path,
+        remote::{AvailableModel, fetch_available_models},
+    },
+    terminal::escape_controls,
 };
 
 pub async fn execute(cli: Cli) -> Result<u8> {
@@ -32,7 +36,7 @@ pub async fn execute(cli: Cli) -> Result<u8> {
         Command::Diff(arguments) => diff(&cli.config, arguments),
         Command::Translate(arguments) => translate(&cli.config, arguments).await,
         Command::Model { command } => {
-            handle_model_command(command)?;
+            handle_model_command(command, &cli.config).await?;
             Ok(0)
         }
     }
@@ -249,7 +253,7 @@ fn initialize(config_path: std::path::PathBuf, arguments: InitArgs) -> Result<()
     Ok(())
 }
 
-fn handle_model_command(command: ModelCommand) -> Result<()> {
+async fn handle_model_command(command: ModelCommand, config_path: &Path) -> Result<()> {
     let path = default_model_store_path()?;
     let mut store = ModelStore::load(&path)?;
     match command {
@@ -264,6 +268,36 @@ fn handle_model_command(command: ModelCommand) -> Result<()> {
                 print_model_summary(summary)?;
             }
         }
+        ModelCommand::Available(arguments) => {
+            let models =
+                fetch_available_models(&store, &arguments.name, arguments.url.as_deref()).await?;
+            print_available_models(&models, arguments.json)?;
+        }
+        ModelCommand::Select(arguments) => {
+            if arguments.model.is_none() {
+                require_interactive_model_selection()?;
+            }
+            let models =
+                fetch_available_models(&store, &arguments.name, arguments.url.as_deref()).await?;
+            let selected = select_available_model(models, arguments.model)?;
+            store.select_model(&arguments.name, selected.id)?;
+            store.save(&path)?;
+            println!(
+                "已将模型配置 {} 切换为 {}",
+                arguments.name,
+                store.summary(&arguments.name)?.model
+            );
+        }
+        ModelCommand::Activate { name } => {
+            if !store.contains(&name) {
+                bail!("模型配置不存在: {name}");
+            }
+            if update_project_model(config_path, name.clone())? {
+                println!("已将项目配置切换为模型配置 {name}");
+            } else {
+                println!("项目配置已使用模型配置 {name}");
+            }
+        }
         ModelCommand::Show { name } => print_model_summary(store.summary(&name)?)?,
         ModelCommand::Delete { name } => {
             store.delete(&name)?;
@@ -272,6 +306,83 @@ fn handle_model_command(command: ModelCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_available_models(models: &[AvailableModel], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(models)?);
+        return Ok(());
+    }
+    if models.is_empty() {
+        println!("未返回可用模型");
+        return Ok(());
+    }
+    for model in models {
+        if let Some(owned_by) = &model.owned_by {
+            println!(
+                "{}\t{}",
+                escape_controls(&model.id),
+                escape_controls(owned_by)
+            );
+        } else {
+            println!("{}", escape_controls(&model.id));
+        }
+    }
+    Ok(())
+}
+
+fn select_available_model(
+    models: Vec<AvailableModel>,
+    requested: Option<String>,
+) -> Result<AvailableModel> {
+    if models.is_empty() {
+        bail!("远程接口未返回可用模型");
+    }
+    if let Some(requested) = requested {
+        return models
+            .into_iter()
+            .find(|model| model.id == requested)
+            .ok_or_else(|| anyhow::anyhow!("远程模型列表中不存在: {requested}"));
+    }
+    println!("可用模型：");
+    for (index, model) in models.iter().enumerate() {
+        println!("  {}. {}", index + 1, escape_controls(&model.id));
+    }
+    let index = loop {
+        print!("请选择模型编号: ");
+        io::stdout().flush().context("无法刷新终端输出")?;
+        let mut input = String::new();
+        if io::stdin()
+            .read_line(&mut input)
+            .context("无法读取模型编号")?
+            == 0
+        {
+            bail!("未读取到模型编号");
+        }
+        match parse_model_selection(&input, models.len()) {
+            Ok(index) => break index,
+            Err(error) => eprintln!("{error}"),
+        }
+    };
+    Ok(models
+        .into_iter()
+        .nth(index)
+        .expect("validated model selection index"))
+}
+
+fn require_interactive_model_selection() -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("非交互环境必须指定模型 ID");
+    }
+    Ok(())
+}
+
+fn parse_model_selection(input: &str, model_count: usize) -> Result<usize> {
+    let selection: usize = input.trim().parse().context("请输入有效的模型编号")?;
+    if !(1..=model_count).contains(&selection) {
+        bail!("模型编号必须在 1 到 {model_count} 之间");
+    }
+    Ok(selection - 1)
 }
 
 fn read_model_arguments(
@@ -313,4 +424,17 @@ fn print_model_summary(summary: ModelSummary<'_>) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_one_based_model_selection() {
+        assert_eq!(parse_model_selection("2\n", 3).unwrap(), 1);
+        assert!(parse_model_selection("0", 3).is_err());
+        assert!(parse_model_selection("4", 3).is_err());
+        assert!(parse_model_selection("invalid", 3).is_err());
+    }
 }

@@ -12,6 +12,9 @@ use url::{Host, Url};
 
 use crate::atomic_file;
 
+/// OpenAI 兼容的远程模型发现客户端。
+pub(crate) mod remote;
+
 const MAX_MODEL_STORE_SIZE: u64 = 1024 * 1024;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -47,6 +50,11 @@ pub struct ModelSummary<'a> {
     pub url: &'a str,
     pub model: &'a str,
     pub has_key: bool,
+}
+
+pub(crate) struct ModelConnection<'a> {
+    pub url: Url,
+    pub api_key: Option<&'a str>,
 }
 
 impl ModelStore {
@@ -126,6 +134,21 @@ impl ModelStore {
             .ok_or_else(|| ModelStoreError::Missing(name.to_owned()))
     }
 
+    /// 仅更新命名配置使用的远程模型 ID，保留接口地址和密钥。
+    pub(crate) fn select_model(
+        &mut self,
+        name: &str,
+        model: String,
+    ) -> Result<(), ModelStoreError> {
+        validate_model(&model)?;
+        let profile = self
+            .profiles
+            .get_mut(name)
+            .ok_or_else(|| ModelStoreError::Missing(name.to_owned()))?;
+        profile.model = model;
+        Ok(())
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.profiles.contains_key(name)
     }
@@ -149,6 +172,17 @@ impl ModelStore {
             url: &profile.url,
             model: &profile.model,
             has_key: profile.api_key.is_some(),
+        })
+    }
+
+    pub(crate) fn connection(&self, name: &str) -> Result<ModelConnection<'_>, ModelStoreError> {
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| ModelStoreError::Missing(name.to_owned()))?;
+        Ok(ModelConnection {
+            url: validate_url(&profile.url)?,
+            api_key: profile.api_key.as_deref(),
         })
     }
 
@@ -224,13 +258,18 @@ fn validate_name(name: &str) -> Result<(), ModelStoreError> {
 
 fn validate_profile(url: &str, model: &str, api_key: Option<&str>) -> Result<(), ModelStoreError> {
     validate_url(url)?;
-    if model.trim().is_empty() {
-        return Err(ModelStoreError::Invalid("模型名称不能为空".into()));
-    }
+    validate_model(model)?;
     if api_key.is_some_and(str::is_empty) {
         return Err(ModelStoreError::Invalid(
             "API key 不能为空；无鉴权服务请使用 --no-key".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_model(model: &str) -> Result<(), ModelStoreError> {
+    if model.trim().is_empty() {
+        return Err(ModelStoreError::Invalid("模型名称不能为空".into()));
     }
     Ok(())
 }
@@ -336,5 +375,27 @@ mod tests {
             .unwrap();
 
         assert!(!store.summary("local").unwrap().has_key);
+    }
+
+    #[test]
+    fn selects_model_without_changing_connection_or_key() {
+        let mut store = ModelStore::default();
+        store
+            .set(
+                "default".into(),
+                "https://example.com/v1/chat/completions".into(),
+                "old-model".into(),
+                Some("top-secret".into()),
+            )
+            .unwrap();
+
+        store.select_model("default", "new-model".into()).unwrap();
+
+        let summary = store.summary("default").unwrap();
+        assert_eq!(summary.url, "https://example.com/v1/chat/completions");
+        assert_eq!(summary.model, "new-model");
+        assert!(summary.has_key);
+        let profile = store.into_profile("default").unwrap();
+        assert_eq!(profile.api_key.unwrap().expose_secret(), "top-secret");
     }
 }

@@ -69,6 +69,12 @@ pub enum ModelCommand {
     Set(ModelSetArgs),
     /// 列出全部模型配置
     List,
+    /// 获取命名配置可用的远程模型
+    Available(ModelAvailableArgs),
+    /// 切换命名配置使用的远程模型
+    Select(ModelSelectArgs),
+    /// 切换项目配置使用的命名模型配置
+    Activate { name: String },
     /// 显示一个已脱敏的模型配置
     Show { name: String },
     /// 删除一个模型配置
@@ -88,6 +94,23 @@ pub struct ModelSetArgs {
     pub key_stdin: bool,
     #[arg(long, conflicts_with_all = ["key", "key_stdin"])]
     pub no_key: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelAvailableArgs {
+    pub name: String,
+    #[arg(long)]
+    pub url: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelSelectArgs {
+    pub name: String,
+    pub model: Option<String>,
+    #[arg(long)]
+    pub url: Option<String>,
 }
 
 #[cfg(test)]
@@ -131,5 +154,42 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_remote_model_commands() {
+        let available =
+            Cli::try_parse_from(["locale-forge", "model", "available", "default", "--json"])
+                .unwrap();
+        let Command::Model {
+            command: ModelCommand::Available(arguments),
+        } = available.command
+        else {
+            panic!("expected available command");
+        };
+        assert_eq!(arguments.name, "default");
+        assert!(arguments.json);
+
+        let select =
+            Cli::try_parse_from(["locale-forge", "model", "select", "default", "new-model"])
+                .unwrap();
+        let Command::Model {
+            command: ModelCommand::Select(arguments),
+        } = select.command
+        else {
+            panic!("expected select command");
+        };
+        assert_eq!(arguments.name, "default");
+        assert_eq!(arguments.model.as_deref(), Some("new-model"));
+
+        let activate =
+            Cli::try_parse_from(["locale-forge", "model", "activate", "default"]).unwrap();
+        let Command::Model {
+            command: ModelCommand::Activate { name },
+        } = activate.command
+        else {
+            panic!("expected activate command");
+        };
+        assert_eq!(name, "default");
     }
 }
