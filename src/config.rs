@@ -33,6 +33,9 @@ pub struct SourceConfig {
 pub struct TargetConfig {
     pub locale: String,
     pub language: String,
+    /// 覆盖全局输出模板的目标文件路径，相对于项目配置文件解析。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 }
@@ -102,11 +105,16 @@ impl LoadedProjectConfig {
     }
 
     pub fn target_path(&self, target: &TargetConfig) -> PathBuf {
-        normalize_lexically(
-            &self
-                .base_dir
-                .join(self.config.output.replace("{locale}", &target.locale)),
-        )
+        resolve_target_path(&self.base_dir, &self.config.output, target)
+    }
+}
+
+fn resolve_target_path(base_dir: &Path, output_template: &str, target: &TargetConfig) -> PathBuf {
+    match target.output.as_deref() {
+        Some(output) => normalize_lexically(&base_dir.join(output)),
+        None => {
+            normalize_lexically(&base_dir.join(output_template.replace("{locale}", &target.locale)))
+        }
     }
 }
 
@@ -164,8 +172,7 @@ pub fn validate_project_config(config: &ProjectConfig, base_dir: &Path) -> Resul
             )));
         }
 
-        let target_path =
-            normalize_lexically(&base_dir.join(config.output.replace("{locale}", &target.locale)));
+        let target_path = resolve_target_path(base_dir, &config.output, target);
         if extension(&target_path)? != source_format {
             return Err(ConfigError::Invalid(format!(
                 "目标文件 {} 与源文件格式不一致",
@@ -325,6 +332,7 @@ mod tests {
             targets: vec![TargetConfig {
                 locale: "en-US".into(),
                 language: "English (United States)".into(),
+                output: None,
                 prompt: None,
             }],
             translation: TranslationConfig::default(),
@@ -344,6 +352,23 @@ mod tests {
             loaded.target_path(&loaded.config.targets[0]),
             directory.path().join("locales/en-US.json")
         );
+    }
+
+    #[test]
+    fn target_output_overrides_global_template() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let mut config = valid_config();
+        config.targets[0].output = Some("locales/en.json".into());
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let loaded = LoadedProjectConfig::load(&path).unwrap();
+
+        assert_eq!(
+            loaded.target_path(&loaded.config.targets[0]),
+            directory.path().join("locales/en.json")
+        );
+        assert_eq!(loaded.config.targets[0].locale, "en-US");
     }
 
     #[test]
@@ -372,6 +397,7 @@ mod tests {
         config.targets.push(TargetConfig {
             locale: "en-us".into(),
             language: "English".into(),
+            output: None,
             prompt: None,
         });
 
@@ -391,16 +417,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_target_output_with_different_format() {
+        let mut config = valid_config();
+        config.targets[0].output = Some("locales/en.arb".into());
+
+        let error = validate_project_config(&config, Path::new(".")).unwrap_err();
+
+        assert!(error.to_string().contains("格式不一致"));
+    }
+
+    #[test]
     fn rejects_paths_that_collide_after_normalization() {
         let mut config = valid_config();
         config.output = "locales/{locale}/../output.json".into();
         config.targets.push(TargetConfig {
             locale: "ja-JP".into(),
             language: "Japanese".into(),
+            output: None,
             prompt: None,
         });
 
         let error = validate_project_config(&config, Path::new("C:/project")).unwrap_err();
+
+        assert!(error.to_string().contains("同一路径"));
+    }
+
+    #[test]
+    fn rejects_duplicate_target_specific_outputs() {
+        let mut config = valid_config();
+        config.targets[0].output = Some("locales/shared.json".into());
+        config.targets.push(TargetConfig {
+            locale: "ja-JP".into(),
+            language: "Japanese".into(),
+            output: Some("locales/shared.json".into()),
+            prompt: None,
+        });
+
+        let error = validate_project_config(&config, Path::new(".")).unwrap_err();
 
         assert!(error.to_string().contains("同一路径"));
     }

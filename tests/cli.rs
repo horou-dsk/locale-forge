@@ -38,6 +38,7 @@ fn target(locale: &str, language: &str) -> TargetConfig {
     TargetConfig {
         locale: locale.into(),
         language: language.into(),
+        output: None,
         prompt: None,
     }
 }
@@ -100,19 +101,17 @@ fn diff_reports_missing_fields_and_uses_exit_code_two() {
 }
 
 #[test]
-fn translate_creates_target_for_empty_source_catalog() {
+fn translate_writes_target_specific_output() {
     let directory = tempfile::tempdir().unwrap();
     let locales = directory.path().join("locales");
     fs::create_dir(&locales).unwrap();
     fs::write(locales.join("zh.json"), "{}").unwrap();
     let config_path = directory.path().join("config.json");
+    let mut japanese = target("ja-JP", "Japanese");
+    japanese.output = Some("locales/ja.json".into());
     fs::write(
         &config_path,
-        serde_json::to_vec(&project_config(vec![target(
-            "en-US",
-            "English (United States)",
-        )]))
-        .unwrap(),
+        serde_json::to_vec(&project_config(vec![japanese])).unwrap(),
     )
     .unwrap();
     let model_store_path = directory.path().join("models.json");
@@ -134,8 +133,9 @@ fn translate_creates_target_for_empty_source_catalog() {
         .success();
 
     let target: Value =
-        serde_json::from_slice(&fs::read(locales.join("en-US.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(locales.join("ja.json")).unwrap()).unwrap();
     assert_eq!(target, json!({}));
+    assert!(!locales.join("ja-JP.json").exists());
 }
 
 struct FirstSuccessThenFailure {

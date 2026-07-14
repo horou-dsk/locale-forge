@@ -29,7 +29,7 @@ locale-forge init --source locales/zh.json --source-locale zh-CN `
   --target en-US --target ja-JP
 ```
 
-生成的 `config.json` 可为每个目标语言补充更准确的 `language` 和可选 `prompt`。所有相对路径均以配置文件所在目录为基准。
+生成的 `config.json` 可为每个目标语言补充更准确的 `language`、可选 `prompt` 和独立 `output`。所有相对路径均以配置文件所在目录为基准。
 
 配置模型：
 
@@ -67,6 +67,11 @@ locale-forge translate --locale ja-JP --force
       "locale": "en-US",
       "language": "English (United States)",
       "prompt": "Use concise product UI language"
+    },
+    {
+      "locale": "ja-JP",
+      "language": "Japanese",
+      "output": "locales/ja.json"
     }
   ],
   "translation": {
@@ -76,6 +81,8 @@ locale-forge translate --locale ja-JP --force
   }
 }
 ```
+
+`targets[].output` 会覆盖该语言的全局 `output` 模板。例如上例仍使用 `ja-JP` 作为翻译语言代码和 ARB 的 `@@locale`，但文件写入 `locales/ja.json`。未配置时继续按全局模板生成文件名。
 
 JSON 源只生成 JSON，ARB 源只生成 ARB。模型必须支持 Chat Completions 的 `response_format.type=json_schema` 严格结构化输出；工具不会静默降级到普通 JSON 模式。
 

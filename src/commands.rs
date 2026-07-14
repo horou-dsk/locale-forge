@@ -230,6 +230,7 @@ fn initialize(config_path: std::path::PathBuf, arguments: InitArgs) -> Result<()
         .map(|locale| TargetConfig {
             language: locale.clone(),
             locale,
+            output: None,
             prompt: None,
         })
         .collect();

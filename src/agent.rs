@@ -209,6 +209,7 @@ mod tests {
         TargetConfig {
             locale: "en-US".into(),
             language: "English (United States)".into(),
+            output: None,
             prompt: None,
         }
     }
