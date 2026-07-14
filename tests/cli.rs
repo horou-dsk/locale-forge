@@ -401,7 +401,13 @@ async fn translate_commits_each_locale_atomically() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("ja-JP"));
+        .stderr(predicate::str::contains("en-US: 待翻译 1 个字段，共 1 批"))
+        .stderr(predicate::str::contains(
+            "en-US: [1/1] 第 1/1 次请求，包含 1 个字段",
+        ))
+        .stderr(predicate::str::contains("en-US: [1/1] 已完成 1/1 个字段"))
+        .stderr(predicate::str::contains("ja-JP: [1/1] 第 1/1 次请求失败"))
+        .stderr(predicate::str::contains("不再重试"));
 
     let english: Value =
         serde_json::from_slice(&fs::read(locales.join("en-US.json")).unwrap()).unwrap();

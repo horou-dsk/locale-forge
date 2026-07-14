@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -9,9 +12,18 @@ use crate::{
 };
 
 pub mod openai;
+pub mod progress;
+
+use progress::{NoopTranslationProgress, TranslationProgress, TranslationProgressReporter};
 
 const MAX_UNIT_BYTES: usize = 256 * 1024;
 const MAX_BATCH_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Copy)]
+struct BatchPosition {
+    index: usize,
+    total: usize,
+}
 
 pub struct ModelRequest<'a> {
     pub source_locale: &'a str,
@@ -50,53 +62,138 @@ impl<C: ModelClient> TranslationAgent<C> {
         target: &TargetConfig,
         units: &[TranslationUnit],
     ) -> Result<BTreeMap<String, String>, AgentError> {
+        self.translate_with_progress(
+            catalog,
+            source_locale,
+            target,
+            units,
+            &NoopTranslationProgress,
+        )
+        .await
+    }
+
+    pub async fn translate_with_progress<P: TranslationProgressReporter + ?Sized>(
+        &self,
+        catalog: &Catalog,
+        source_locale: &str,
+        target: &TargetConfig,
+        units: &[TranslationUnit],
+        progress: &P,
+    ) -> Result<BTreeMap<String, String>, AgentError> {
         for unit in units {
             if unit.source.len() > MAX_UNIT_BYTES {
                 return Err(AgentError::UnitTooLarge(unit.path.clone()));
             }
         }
 
+        let total_batches = batch_count(units, self.batch_size);
+        progress.report(TranslationProgress::Started {
+            locale: &target.locale,
+            total_units: units.len(),
+            total_batches,
+        });
         let mut translations = BTreeMap::new();
         let mut start = 0;
+        let mut batch_index = 1;
         while start < units.len() {
             let end = batch_end(units, start, self.batch_size);
             let batch = &units[start..end];
+            let batch_started = Instant::now();
             let batch_translations = self
-                .translate_batch(catalog, source_locale, target, batch)
+                .translate_batch(
+                    catalog,
+                    source_locale,
+                    target,
+                    batch,
+                    BatchPosition {
+                        index: batch_index,
+                        total: total_batches,
+                    },
+                    progress,
+                )
                 .await?;
             translations.extend(batch_translations);
+            progress.report(TranslationProgress::BatchCompleted {
+                locale: &target.locale,
+                batch_index,
+                total_batches,
+                completed_units: end,
+                total_units: units.len(),
+                elapsed: batch_started.elapsed(),
+            });
             start = end;
+            batch_index += 1;
         }
         Ok(translations)
     }
 
-    async fn translate_batch(
+    async fn translate_batch<P: TranslationProgressReporter + ?Sized>(
         &self,
         catalog: &Catalog,
         source_locale: &str,
         target: &TargetConfig,
         units: &[TranslationUnit],
+        batch: BatchPosition,
+        progress: &P,
     ) -> Result<BTreeMap<String, String>, AgentError> {
         let mut correction = None;
+        let max_attempts = self.max_retries.saturating_add(1);
         for attempt in 0..=self.max_retries {
+            let attempt_number = attempt + 1;
+            progress.report(TranslationProgress::BatchAttemptStarted {
+                locale: &target.locale,
+                batch_index: batch.index,
+                total_batches: batch.total,
+                attempt: attempt_number,
+                max_attempts,
+                unit_count: units.len(),
+            });
             let request = ModelRequest {
                 source_locale,
                 target,
                 units,
                 correction: correction.as_deref(),
             };
+            let attempt_started = Instant::now();
             match self.client.translate_batch(request).await {
                 Ok(response) => match validate_batch(catalog, units, response) {
                     Ok(translations) => return Ok(translations),
                     Err(error) => correction = Some(error.to_string()),
                 },
                 Err(error) if error.retryable => correction = Some(error.message),
-                Err(error) => return Err(AgentError::Client(error.message)),
+                Err(error) => {
+                    progress.report(TranslationProgress::BatchAttemptFailed {
+                        locale: &target.locale,
+                        batch_index: batch.index,
+                        total_batches: batch.total,
+                        attempt: attempt_number,
+                        max_attempts,
+                        elapsed: attempt_started.elapsed(),
+                        reason: &error.message,
+                        retry_delay: None,
+                    });
+                    return Err(AgentError::Client(error.message));
+                }
             }
 
-            if attempt < self.max_retries {
+            let retry_delay = if attempt < self.max_retries {
                 let multiplier = 1_u64 << attempt.min(5);
-                tokio::time::sleep(Duration::from_millis(250 * multiplier)).await;
+                Some(Duration::from_millis(250 * multiplier))
+            } else {
+                None
+            };
+            progress.report(TranslationProgress::BatchAttemptFailed {
+                locale: &target.locale,
+                batch_index: batch.index,
+                total_batches: batch.total,
+                attempt: attempt_number,
+                max_attempts,
+                elapsed: attempt_started.elapsed(),
+                reason: correction.as_deref().unwrap_or("模型未返回有效结果"),
+                retry_delay,
+            });
+            if let Some(delay) = retry_delay {
+                tokio::time::sleep(delay).await;
             }
         }
 
@@ -104,6 +201,16 @@ impl<C: ModelClient> TranslationAgent<C> {
             correction.unwrap_or_else(|| "模型未返回有效结果".into()),
         ))
     }
+}
+
+fn batch_count(units: &[TranslationUnit], batch_size: usize) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while start < units.len() {
+        start = batch_end(units, start, batch_size);
+        count += 1;
+    }
+    count
 }
 
 fn batch_end(units: &[TranslationUnit], start: usize, batch_size: usize) -> usize {
@@ -189,10 +296,45 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+    use crate::agent::progress::{TranslationProgress, TranslationProgressReporter};
     use crate::catalog::{CatalogFormat, TranslationKind};
 
     struct FakeClient {
         responses: Mutex<VecDeque<Result<BTreeMap<String, String>, ModelClientError>>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl TranslationProgressReporter for RecordingProgress {
+        fn report(&self, progress: TranslationProgress<'_>) {
+            let event = match progress {
+                TranslationProgress::Started {
+                    total_units,
+                    total_batches,
+                    ..
+                } => format!("started:{total_units}:{total_batches}"),
+                TranslationProgress::BatchAttemptStarted {
+                    batch_index,
+                    attempt,
+                    ..
+                } => format!("attempt:{batch_index}:{attempt}"),
+                TranslationProgress::BatchAttemptFailed {
+                    batch_index,
+                    attempt,
+                    retry_delay,
+                    ..
+                } => format!("failed:{batch_index}:{attempt}:{}", retry_delay.is_some()),
+                TranslationProgress::BatchCompleted {
+                    batch_index,
+                    completed_units,
+                    ..
+                } => format!("completed:{batch_index}:{completed_units}"),
+            };
+            self.events.lock().unwrap().push(event);
+        }
     }
 
     #[async_trait]
@@ -270,13 +412,24 @@ mod tests {
             ])),
         };
         let agent = TranslationAgent::new(client, 40, 1);
+        let progress = RecordingProgress::default();
 
         let result = agent
-            .translate(&catalog, "zh-CN", &target(), &diff.units)
+            .translate_with_progress(&catalog, "zh-CN", &target(), &diff.units, &progress)
             .await
             .unwrap();
 
         assert_eq!(result["/home"], "Home");
+        assert_eq!(
+            *progress.events.lock().unwrap(),
+            [
+                "started:1:1",
+                "attempt:1:1",
+                "failed:1:1:true",
+                "attempt:1:2",
+                "completed:1:1",
+            ]
+        );
     }
 
     #[test]
@@ -299,5 +452,6 @@ mod tests {
         ];
 
         assert_eq!(batch_end(&units, 0, 40), 1);
+        assert_eq!(batch_count(&units, 40), 2);
     }
 }

@@ -7,8 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+mod progress;
+
+use self::progress::ConsoleTranslationProgress;
 use crate::{
-    agent::{TranslationAgent, openai::OpenAiClient},
+    agent::{TranslationAgent, openai::OpenAiClient, progress::TranslationProgressReporter},
     atomic_file,
     catalog::{Catalog, CatalogFormat, DiffReport},
     cli::{Cli, Command, DiffArgs, InitArgs, ModelCommand, ModelSetArgs, TranslateArgs},
@@ -97,6 +100,7 @@ async fn translate(config_path: &Path, arguments: TranslateArgs) -> Result<u8> {
         project.config.translation.batch_size,
         project.config.translation.max_retries,
     );
+    let progress = ConsoleTranslationProgress;
     let mut failures = Vec::new();
 
     for target in targets {
@@ -108,6 +112,7 @@ async fn translate(config_path: &Path, arguments: TranslateArgs) -> Result<u8> {
             target,
             &target_path,
             arguments.force,
+            &progress,
         )
         .await
         {
@@ -131,13 +136,14 @@ async fn translate(config_path: &Path, arguments: TranslateArgs) -> Result<u8> {
     Ok(1)
 }
 
-async fn translate_target<C: crate::agent::ModelClient>(
+async fn translate_target<C: crate::agent::ModelClient, P: TranslationProgressReporter + ?Sized>(
     source: &Catalog,
     agent: &TranslationAgent<C>,
     source_locale: &str,
     target: &TargetConfig,
     target_path: &Path,
     force: bool,
+    progress: &P,
 ) -> Result<usize> {
     let target_catalog = Catalog::load_optional(target_path, source.format())?;
     let target_missing = target_catalog.is_none();
@@ -160,7 +166,7 @@ async fn translate_target<C: crate::agent::ModelClient>(
 
     let translated_count = diff.units.len();
     let translations = agent
-        .translate(source, source_locale, target, &diff.units)
+        .translate_with_progress(source, source_locale, target, &diff.units, progress)
         .await?;
     let merged = source.merge(target_catalog, translations, &target.locale)?;
     let contents = merged.to_pretty_bytes()?;
