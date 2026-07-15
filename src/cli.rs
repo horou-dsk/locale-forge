@@ -26,6 +26,11 @@ pub enum Command {
     Diff(DiffArgs),
     /// 翻译缺失字段或强制重新翻译
     Translate(TranslateArgs),
+    /// 管理源文指纹和现有译文基线
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
     /// 管理用户级模型配置
     Model {
         #[command(subcommand)]
@@ -61,6 +66,18 @@ pub struct TranslateArgs {
     pub locales: Vec<String>,
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StateCommand {
+    /// 接受现有目标文件并更新翻译基线
+    Update(StateUpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StateUpdateArgs {
+    #[arg(long = "locale")]
+    pub locales: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,5 +208,27 @@ mod tests {
             panic!("expected activate command");
         };
         assert_eq!(name, "default");
+    }
+
+    #[test]
+    fn parses_state_update_locale_filters() {
+        let cli = Cli::try_parse_from([
+            "locale-forge",
+            "state",
+            "update",
+            "--locale",
+            "en-US",
+            "--locale",
+            "ja-JP",
+        ])
+        .unwrap();
+
+        let Command::State {
+            command: StateCommand::Update(arguments),
+        } = cli.command
+        else {
+            panic!("expected state update command");
+        };
+        assert_eq!(arguments.locales, ["en-US", "ja-JP"]);
     }
 }

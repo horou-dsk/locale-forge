@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{self, IsTerminal, Read, Write},
     path::Path,
@@ -8,13 +9,16 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 mod progress;
+mod state;
 
 use self::progress::ConsoleTranslationProgress;
 use crate::{
     agent::{TranslationAgent, openai::OpenAiClient, progress::TranslationProgressReporter},
     atomic_file,
     catalog::{Catalog, CatalogFormat, DiffReport},
-    cli::{Cli, Command, DiffArgs, InitArgs, ModelCommand, ModelSetArgs, TranslateArgs},
+    cli::{
+        Cli, Command, DiffArgs, InitArgs, ModelCommand, ModelSetArgs, StateCommand, TranslateArgs,
+    },
     config::{
         LoadedProjectConfig, ProjectConfig, SourceConfig, TargetConfig, TranslationConfig,
         update_project_model, write_new_project_config,
@@ -23,6 +27,7 @@ use crate::{
         ModelStore, ModelSummary, default_model_store_path,
         remote::{AvailableModel, fetch_available_models},
     },
+    state::{SourceFingerprints, TranslationState, state_path},
     terminal::escape_controls,
 };
 
@@ -38,6 +43,9 @@ pub async fn execute(cli: Cli) -> Result<u8> {
         }
         Command::Diff(arguments) => diff(&cli.config, arguments),
         Command::Translate(arguments) => translate(&cli.config, arguments).await,
+        Command::State { command } => match command {
+            StateCommand::Update(arguments) => state::update(&cli.config, arguments),
+        },
         Command::Model { command } => {
             handle_model_command(command, &cli.config).await?;
             Ok(0)
@@ -48,8 +56,46 @@ pub async fn execute(cli: Cli) -> Result<u8> {
 fn validate(config_path: &Path) -> Result<()> {
     let project = LoadedProjectConfig::load(config_path)?;
     let source = Catalog::load(&project.source_path)?;
+    let path = state_path(&project.base_dir);
+    let state = TranslationState::load(&path)?;
+    if state
+        .as_ref()
+        .is_some_and(|state| !state.matches_source(&project.config.source.locale, source.format()))
+    {
+        bail!(
+            "翻译状态的源语言或格式已变化，请执行 `locale-forge --config {} state update` 重建基线",
+            project.config_path.display()
+        );
+    }
+    let fingerprints = source.source_fingerprints();
     for target in &project.config.targets {
-        Catalog::load_optional(&project.target_path(target), source.format())?;
+        let Some(target_catalog) =
+            Catalog::load_optional(&project.target_path(target), source.format())?
+        else {
+            continue;
+        };
+        let Some(baseline) = state
+            .as_ref()
+            .and_then(|state| state.target(&target.locale))
+        else {
+            bail!(
+                "目标语言 {} 缺少翻译基线，请执行 `locale-forge --config {} state update --locale {}` 或使用 `translate --force`",
+                target.locale,
+                project.config_path.display(),
+                target.locale
+            );
+        };
+        let outdated = outdated_paths(&fingerprints, baseline);
+        let diff =
+            source.diff_with_outdated(Some(&target_catalog), &target.locale, false, &outdated)?;
+        if let Some(conflict) = diff.report.conflicts.first() {
+            bail!(
+                "目标语言 {} 在 {} 存在类型冲突",
+                target.locale,
+                conflict.path
+            );
+        }
+        source.validate_existing_translations_except(&target_catalog, &outdated)?;
     }
     let model_store = ModelStore::load(&default_model_store_path()?)?;
     if !model_store.contains(&project.config.model) {
@@ -68,11 +114,30 @@ fn diff(config_path: &Path, arguments: DiffArgs) -> Result<u8> {
     let project = LoadedProjectConfig::load(config_path)?;
     let source = Catalog::load(&project.source_path)?;
     let targets = select_targets(&project.config.targets, &arguments.locales)?;
+    let path = state_path(&project.base_dir);
+    let state = TranslationState::load(&path)?;
+    let fingerprints = source.source_fingerprints();
+    let state_matches = state
+        .as_ref()
+        .is_some_and(|state| state.matches_source(&project.config.source.locale, source.format()));
     let mut reports = Vec::with_capacity(targets.len());
     let mut has_differences = false;
     for target in targets {
         let target_catalog = Catalog::load_optional(&project.target_path(target), source.format())?;
-        let result = source.diff(target_catalog.as_ref(), &target.locale, false)?;
+        let baseline = state
+            .as_ref()
+            .filter(|_| state_matches)
+            .and_then(|state| state.target(&target.locale));
+        let outdated = if target_catalog.is_some() {
+            baseline
+                .map(|baseline| outdated_paths(&fingerprints, baseline))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let mut result =
+            source.diff_with_outdated(target_catalog.as_ref(), &target.locale, false, &outdated)?;
+        result.report.baseline_missing = target_catalog.is_some() && baseline.is_none();
         has_differences |= !result.report.is_clean();
         reports.push(result.report);
     }
@@ -101,27 +166,64 @@ async fn translate(config_path: &Path, arguments: TranslateArgs) -> Result<u8> {
         project.config.translation.max_retries,
     );
     let progress = ConsoleTranslationProgress;
+    let path = state_path(&project.base_dir);
+    let loaded_state = TranslationState::load(&path)?;
+    let mut state = loaded_state
+        .unwrap_or_else(|| TranslationState::new(&project.config.source.locale, source.format()));
+    let fingerprints = source.source_fingerprints();
     let mut failures = Vec::new();
 
     for target in targets {
         let target_path = project.target_path(target);
+        let baseline = state
+            .matches_source(&project.config.source.locale, source.format())
+            .then(|| state.target(&target.locale))
+            .flatten();
         match translate_target(
             &source,
             &agent,
             &project.config.source.locale,
-            target,
-            &target_path,
-            arguments.force,
+            TranslateTargetRequest {
+                target,
+                target_path: &target_path,
+                config_path: &project.config_path,
+                force: arguments.force,
+                baseline,
+                fingerprints: &fingerprints,
+            },
             &progress,
         )
         .await
         {
-            Ok(count) => println!(
-                "{}: 已写入 {}，翻译 {} 个字段",
-                target.locale,
-                target_path.display(),
-                count
-            ),
+            Ok(outcome) => {
+                let mut state_changed = false;
+                if !state.matches_source(&project.config.source.locale, source.format()) {
+                    state.reset_source(&project.config.source.locale, source.format());
+                    state_changed = true;
+                }
+                state_changed |= state.set_target(&target.locale, fingerprints.clone());
+                state_changed |= state.retain_targets(
+                    project
+                        .config
+                        .targets
+                        .iter()
+                        .map(|target| target.locale.as_str()),
+                );
+                if state_changed && let Err(error) = state.save(&path) {
+                    failures.push((target.locale.as_str(), anyhow::anyhow!(error)));
+                    continue;
+                }
+                if outcome.wrote_target {
+                    println!(
+                        "{}: 已写入 {}，翻译 {} 个字段",
+                        target.locale,
+                        target_path.display(),
+                        outcome.translated_count
+                    );
+                } else {
+                    println!("{}: 没有需要同步的字段", target.locale);
+                }
+            }
             Err(error) => failures.push((target.locale.as_str(), error)),
         }
     }
@@ -140,28 +242,51 @@ async fn translate_target<C: crate::agent::ModelClient, P: TranslationProgressRe
     source: &Catalog,
     agent: &TranslationAgent<C>,
     source_locale: &str,
-    target: &TargetConfig,
-    target_path: &Path,
-    force: bool,
+    request: TranslateTargetRequest<'_>,
     progress: &P,
-) -> Result<usize> {
+) -> Result<TranslateOutcome> {
+    let TranslateTargetRequest {
+        target,
+        target_path,
+        config_path,
+        force,
+        baseline,
+        fingerprints,
+    } = request;
     let target_catalog = Catalog::load_optional(target_path, source.format())?;
     let target_missing = target_catalog.is_none();
-    let diff = source.diff(target_catalog.as_ref(), &target.locale, force)?;
+    if !force && !target_missing && baseline.is_none() {
+        bail!(
+            "翻译基线缺失，请先执行 `locale-forge --config \"{}\" state update --locale {}` 接受现有译文，或使用 `locale-forge --config \"{}\" translate --force` 全量重译",
+            config_path.display(),
+            target.locale,
+            config_path.display()
+        );
+    }
+    let outdated = if force || target_missing {
+        HashSet::new()
+    } else {
+        outdated_paths(
+            fingerprints,
+            baseline.expect("existing target baseline was checked above"),
+        )
+    };
+    if !force && let Some(target_catalog) = target_catalog.as_ref() {
+        source.validate_existing_translations_except(target_catalog, &outdated)?;
+    }
+    let diff =
+        source.diff_with_outdated(target_catalog.as_ref(), &target.locale, force, &outdated)?;
     if !diff.report.conflicts.is_empty() {
         bail!(
             "存在 {} 个类型冲突，请先修复目标文件",
             diff.report.conflicts.len()
         );
     }
-    if !target_missing
-        && diff.units.is_empty()
-        && diff.report.missing.is_empty()
-        && diff.report.empty.is_empty()
-        && diff.report.changed.is_empty()
-    {
-        println!("{}: 没有需要翻译的字段", target.locale);
-        return Ok(0);
+    if !target_missing && diff.report.is_clean() && diff.units.is_empty() {
+        return Ok(TranslateOutcome {
+            translated_count: 0,
+            wrote_target: false,
+        });
     }
 
     let translated_count = diff.units.len();
@@ -172,7 +297,35 @@ async fn translate_target<C: crate::agent::ModelClient, P: TranslationProgressRe
     let contents = merged.to_pretty_bytes()?;
     atomic_file::write(target_path, &contents, false)
         .with_context(|| format!("无法原子写入 {}", target_path.display()))?;
-    Ok(translated_count)
+    Ok(TranslateOutcome {
+        translated_count,
+        wrote_target: true,
+    })
+}
+
+struct TranslateOutcome {
+    translated_count: usize,
+    wrote_target: bool,
+}
+
+struct TranslateTargetRequest<'a> {
+    target: &'a TargetConfig,
+    target_path: &'a Path,
+    config_path: &'a Path,
+    force: bool,
+    baseline: Option<&'a SourceFingerprints>,
+    fingerprints: &'a SourceFingerprints,
+}
+
+fn outdated_paths<'a>(
+    current: &'a SourceFingerprints,
+    baseline: &SourceFingerprints,
+) -> HashSet<&'a str> {
+    current
+        .iter()
+        .filter(|(path, fingerprint)| baseline.get(path.as_str()) != Some(*fingerprint))
+        .map(|(path, _)| path.as_str())
+        .collect()
 }
 
 fn select_targets<'a>(
@@ -197,8 +350,17 @@ fn print_diff_report(report: &DiffReport) {
     println!("{}:", report.locale);
     print_paths("缺失", &report.missing);
     print_paths("空值", &report.empty);
+    print_paths("源文已变更", &report.outdated);
     print_paths("结构值变化", &report.changed);
     print_paths("额外", &report.extra);
+    println!(
+        "  翻译基线缺失: {}",
+        if report.baseline_missing {
+            "是"
+        } else {
+            "否"
+        }
+    );
     if report.conflicts.is_empty() {
         println!("  类型冲突: 0");
     } else {

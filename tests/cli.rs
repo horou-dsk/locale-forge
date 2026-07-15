@@ -46,6 +46,16 @@ fn target(locale: &str, language: &str) -> TargetConfig {
     }
 }
 
+fn write_model_store(directory: &std::path::Path, url: String) -> std::path::PathBuf {
+    let path = directory.join("models.json");
+    let mut store = ModelStore::default();
+    store
+        .set("test".into(), url, "test-model".into(), None)
+        .unwrap();
+    store.save(&path).unwrap();
+    path
+}
+
 #[test]
 fn init_creates_config_and_refuses_overwrite() {
     let directory = tempfile::tempdir().unwrap();
@@ -100,7 +110,332 @@ fn diff_reports_missing_fields_and_uses_exit_code_two() {
         .args(["--config", config_path.to_str().unwrap(), "diff", "--json"])
         .assert()
         .code(2)
-        .stdout(predicate::str::contains("/chat/list"));
+        .stdout(predicate::str::contains("/chat/list"))
+        .stdout(predicate::str::contains(r#""baseline_missing": true"#));
+}
+
+#[test]
+fn state_update_accepts_existing_target_without_modifying_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页","chat":"聊天"}"#).unwrap();
+    let target_path = locales.join("en-US.json");
+    let target_contents = br#"{"home":"Home"}"#;
+    fs::write(&target_path, target_contents).unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已接受现有译文状态"));
+
+    assert_eq!(fs::read(&target_path).unwrap(), target_contents);
+    let lock_contents =
+        fs::read_to_string(directory.path().join("locale-forge.lock.json")).unwrap();
+    assert!(!lock_contents.contains("首页"));
+    assert!(!lock_contents.contains("聊天"));
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "diff", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(r#""baseline_missing": false"#))
+        .stdout(predicate::str::contains("/chat"));
+}
+
+#[test]
+fn translate_rejects_existing_target_without_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页"}"#).unwrap();
+    let target_path = locales.join("en-US.json");
+    fs::write(&target_path, r#"{"home":"Home"}"#).unwrap();
+    let original = fs::read(&target_path).unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+    let model_store_path = write_model_store(
+        directory.path(),
+        "http://127.0.0.1:9/v1/chat/completions".into(),
+    );
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["--config", config_path.to_str().unwrap(), "translate"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("翻译基线缺失"))
+        .stderr(predicate::str::contains("state update"))
+        .stderr(predicate::str::contains("--force"));
+
+    assert_eq!(fs::read(&target_path).unwrap(), original);
+    assert!(!directory.path().join("locale-forge.lock.json").exists());
+}
+
+#[test]
+fn extra_only_cleanup_does_not_request_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页"}"#).unwrap();
+    let target_path = locales.join("en-US.json");
+    fs::write(&target_path, r#"{"home":"Home","legacy":"Remove me"}"#).unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success();
+    let model_store_path = write_model_store(
+        directory.path(),
+        "http://127.0.0.1:9/v1/chat/completions".into(),
+    );
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["--config", config_path.to_str().unwrap(), "translate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("翻译 0 个字段"));
+
+    let translated: Value = serde_json::from_slice(&fs::read(target_path).unwrap()).unwrap();
+    assert_eq!(translated, json!({"home": "Home"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_translate_updates_changed_field_and_removes_deleted_field() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    let source_path = locales.join("zh.json");
+    fs::write(
+        &source_path,
+        r#"{"home":"旧首页","chat":"聊天","legacy":"旧字段"}"#,
+    )
+    .unwrap();
+    let target_path = locales.join("en-US.json");
+    fs::write(
+        &target_path,
+        r#"{"home":"Old home","chat":"Chat","legacy":"Legacy"}"#,
+    )
+    .unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success();
+    fs::write(&source_path, r#"{"home":"新首页","chat":"聊天"}"#).unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "diff", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("/home"))
+        .stdout(predicate::str::contains("outdated"));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"translations\":{\"t0\":\"New home\"}}"}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let model_store_path = write_model_store(
+        directory.path(),
+        format!("{}/v1/chat/completions", server.uri()),
+    );
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", &model_store_path)
+        .args(["--config", config_path.to_str().unwrap(), "translate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("翻译 1 个字段"));
+
+    let translated: Value = serde_json::from_slice(&fs::read(target_path).unwrap()).unwrap();
+    assert_eq!(translated, json!({"home": "New home", "chat": "Chat"}));
+}
+
+#[test]
+fn state_update_rejects_incompatible_arb_placeholders() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(
+        locales.join("zh.arb"),
+        r#"{"@@locale":"zh","hello":"你好 {name}","@hello":{"placeholders":{"name":{}}}}"#,
+    )
+    .unwrap();
+    let target_path = locales.join("en.arb");
+    fs::write(
+        &target_path,
+        r#"{"@@locale":"en","hello":"Hello {user}","@hello":{"placeholders":{"user":{}}}}"#,
+    )
+    .unwrap();
+    let mut config = project_config(vec![target("en", "English")]);
+    config.source.path = "locales/zh.arb".into();
+    config.output = "locales/{locale}.arb".into();
+    let config_path = directory.path().join("config.json");
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let original = fs::read(&target_path).unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("变量不一致"));
+
+    assert_eq!(fs::read(target_path).unwrap(), original);
+    assert!(!directory.path().join("locale-forge.lock.json").exists());
+}
+
+#[test]
+fn state_update_keeps_successful_locales_when_another_locale_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页"}"#).unwrap();
+    fs::write(locales.join("en-US.json"), r#"{"home":"Home"}"#).unwrap();
+    fs::write(locales.join("ja-JP.json"), r#"{"home":{"bad":true}}"#).unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![
+            target("en-US", "English"),
+            target("ja-JP", "Japanese"),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("en-US: 已接受"))
+        .stderr(predicate::str::contains("ja-JP"));
+
+    let state: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("locale-forge.lock.json")).unwrap())
+            .unwrap();
+    assert!(state["targets"]["en-US"].is_object());
+    assert!(state["targets"].get("ja-JP").is_none());
+}
+
+#[test]
+fn state_update_rebuilds_state_after_source_identity_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页"}"#).unwrap();
+    fs::write(locales.join("en-US.json"), r#"{"home":"Home"}"#).unwrap();
+    let config_path = directory.path().join("config.json");
+    let mut config = project_config(vec![target("en-US", "English")]);
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success();
+
+    config.source.locale = "zh".into();
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success();
+
+    let state: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("locale-forge.lock.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["source"]["locale"], "zh");
+    assert!(state["targets"]["en-US"].is_object());
+}
+
+#[test]
+fn validate_explains_how_to_create_missing_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    fs::write(locales.join("zh.json"), r#"{"home":"首页"}"#).unwrap();
+    fs::write(locales.join("en-US.json"), r#"{"home":"Home"}"#).unwrap();
+    let config_path = directory.path().join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&project_config(vec![target("en-US", "English")])).unwrap(),
+    )
+    .unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "validate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("缺少翻译基线"))
+        .stderr(predicate::str::contains("state update --locale en-US"));
+}
+
+#[test]
+fn validate_allows_outdated_arb_placeholders_to_be_retranslated() {
+    let directory = tempfile::tempdir().unwrap();
+    let locales = directory.path().join("locales");
+    fs::create_dir(&locales).unwrap();
+    let source_path = locales.join("zh.arb");
+    fs::write(
+        &source_path,
+        r#"{"@@locale":"zh-CN","hello":"你好 {name}","@hello":{"placeholders":{"name":{}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        locales.join("en.arb"),
+        r#"{"@@locale":"en","hello":"Hello {name}","@hello":{"placeholders":{"name":{}}}}"#,
+    )
+    .unwrap();
+    let mut config = project_config(vec![target("en", "English")]);
+    config.source.path = "locales/zh.arb".into();
+    config.output = "locales/{locale}.arb".into();
+    let config_path = directory.path().join("config.json");
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    binary()
+        .args(["--config", config_path.to_str().unwrap(), "state", "update"])
+        .assert()
+        .success();
+
+    fs::write(
+        source_path,
+        r#"{"@@locale":"zh-CN","hello":"你好 {user}","@hello":{"placeholders":{"user":{}}}}"#,
+    )
+    .unwrap();
+    let model_store_path = write_model_store(
+        directory.path(),
+        "http://127.0.0.1:9/v1/chat/completions".into(),
+    );
+
+    binary()
+        .env("LOCALE_FORGE_MODEL_STORE", model_store_path)
+        .args(["--config", config_path.to_str().unwrap(), "validate"])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -139,6 +474,10 @@ fn translate_writes_target_specific_output() {
         serde_json::from_slice(&fs::read(locales.join("ja.json")).unwrap()).unwrap();
     assert_eq!(target, json!({}));
     assert!(!locales.join("ja-JP.json").exists());
+    let state: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("locale-forge.lock.json")).unwrap())
+            .unwrap();
+    assert!(state["targets"]["ja-JP"].is_object());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -415,4 +754,9 @@ async fn translate_commits_each_locale_atomically() {
         serde_json::from_slice(&fs::read(locales.join("ja-JP.json")).unwrap()).unwrap();
     assert_eq!(english["home"], "Home");
     assert_eq!(japanese["home"], "既存");
+    let state: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("locale-forge.lock.json")).unwrap())
+            .unwrap();
+    assert!(state["targets"]["en-US"].is_object());
+    assert!(state["targets"].get("ja-JP").is_none());
 }

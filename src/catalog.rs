@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -7,6 +7,8 @@ use std::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+use crate::state::{SourceFingerprints, fingerprint};
 
 pub mod arb;
 mod json;
@@ -51,18 +53,22 @@ pub struct DiffReport {
     pub locale: String,
     pub missing: Vec<String>,
     pub empty: Vec<String>,
+    pub outdated: Vec<String>,
     pub changed: Vec<String>,
     pub extra: Vec<String>,
     pub conflicts: Vec<TypeConflict>,
+    pub baseline_missing: bool,
 }
 
 impl DiffReport {
     pub fn is_clean(&self) -> bool {
         self.missing.is_empty()
             && self.empty.is_empty()
+            && self.outdated.is_empty()
             && self.changed.is_empty()
             && self.extra.is_empty()
             && self.conflicts.is_empty()
+            && !self.baseline_missing
     }
 }
 
@@ -142,6 +148,16 @@ impl Catalog {
         locale: impl Into<String>,
         force: bool,
     ) -> Result<CatalogDiff, CatalogError> {
+        self.diff_with_outdated(target, locale, force, &HashSet::new())
+    }
+
+    pub(crate) fn diff_with_outdated(
+        &self,
+        target: Option<&Catalog>,
+        locale: impl Into<String>,
+        force: bool,
+        outdated: &HashSet<&str>,
+    ) -> Result<CatalogDiff, CatalogError> {
         if target.is_some_and(|catalog| catalog.format != self.format) {
             return Err(CatalogError::FormatMismatch);
         }
@@ -150,9 +166,11 @@ impl Catalog {
                 locale: locale.into(),
                 missing: Vec::new(),
                 empty: Vec::new(),
+                outdated: Vec::new(),
                 changed: Vec::new(),
                 extra: Vec::new(),
                 conflicts: Vec::new(),
+                baseline_missing: false,
             },
             units: Vec::new(),
         };
@@ -163,6 +181,7 @@ impl Catalog {
                 target.map(|catalog| &catalog.root),
                 "",
                 force,
+                outdated,
                 &mut diff,
             ),
             CatalogFormat::Arb => diff_arb(
@@ -176,10 +195,90 @@ impl Catalog {
                         .expect("ARB root was validated as an object")
                 }),
                 force,
+                outdated,
                 &mut diff,
             ),
         }
         Ok(diff)
+    }
+
+    pub fn source_fingerprints(&self) -> SourceFingerprints {
+        let mut fingerprints = BTreeMap::new();
+        match self.format {
+            CatalogFormat::Json => json::fingerprints(&self.root, "", &mut fingerprints),
+            CatalogFormat::Arb => {
+                let source = self
+                    .root
+                    .as_object()
+                    .expect("ARB root was validated as an object");
+                for (key, value) in source {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    let context = arb::context(source, key);
+                    fingerprints.insert(
+                        pointer_child("", key),
+                        fingerprint(
+                            CatalogFormat::Arb,
+                            value
+                                .as_str()
+                                .expect("ARB messages were validated as strings"),
+                            context.description.as_deref(),
+                            context.placeholders.iter().map(String::as_str),
+                        ),
+                    );
+                }
+            }
+        }
+        fingerprints
+    }
+
+    pub fn validate_existing_translations(&self, target: &Catalog) -> Result<(), CatalogError> {
+        self.validate_existing_translations_except(target, &HashSet::new())
+    }
+
+    pub(crate) fn validate_existing_translations_except(
+        &self,
+        target: &Catalog,
+        ignored_paths: &HashSet<&str>,
+    ) -> Result<(), CatalogError> {
+        if target.format != self.format {
+            return Err(CatalogError::FormatMismatch);
+        }
+        if self.format != CatalogFormat::Arb {
+            return Ok(());
+        }
+        let source = self
+            .root
+            .as_object()
+            .expect("ARB root was validated as an object");
+        let target = target
+            .root
+            .as_object()
+            .expect("ARB root was validated as an object");
+        for (key, source_value) in source {
+            if key.starts_with('@') {
+                continue;
+            }
+            let path = pointer_child("", key);
+            if ignored_paths.contains(path.as_str()) {
+                continue;
+            }
+            let Some(target_text) = target.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            if target_text.is_empty() {
+                continue;
+            }
+            arb::validate_translation(
+                key,
+                source_value
+                    .as_str()
+                    .expect("ARB messages were validated as strings"),
+                target_text,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn validate_translation(
@@ -267,6 +366,7 @@ fn diff_arb(
     source: &Map<String, Value>,
     target: Option<&Map<String, Value>>,
     force: bool,
+    outdated: &HashSet<&str>,
     diff: &mut CatalogDiff,
 ) {
     if target
@@ -277,8 +377,14 @@ fn diff_arb(
         diff.report.changed.push("/@@locale".into());
     }
     for (key, value) in source {
+        if key.starts_with("@@") {
+            if key != "@@locale" && target.is_some_and(|target| !target.contains_key(key)) {
+                diff.report.changed.push(pointer_child("", key));
+            }
+            continue;
+        }
         if key.starts_with('@') {
-            if key != "@@locale" && target.and_then(|map| map.get(key)) != Some(value) {
+            if target.and_then(|map| map.get(key)) != Some(value) {
                 diff.report.changed.push(pointer_child("", key));
             }
             continue;
@@ -301,6 +407,15 @@ fn diff_arb(
             Some(Value::String(_)) if force && !source_text.is_empty() => {
                 push_arb_unit(source, key, source_text, path, diff);
             }
+            Some(Value::String(_)) if outdated.contains(path.as_str()) => {
+                diff.report.outdated.push(path.clone());
+                push_arb_unit(source, key, source_text, path, diff);
+            }
+            Some(Value::String(target_text))
+                if source_text.is_empty() && !target_text.is_empty() =>
+            {
+                diff.report.changed.push(path);
+            }
             Some(Value::String(_)) => {}
             Some(other) => diff.report.conflicts.push(TypeConflict {
                 path,
@@ -311,7 +426,7 @@ fn diff_arb(
     }
     if let Some(target) = target {
         for key in target.keys() {
-            if !key.starts_with('@') && !source.contains_key(key) {
+            if !key.starts_with("@@") && !source.contains_key(key) {
                 diff.report.extra.push(pointer_child("", key));
             }
         }
@@ -354,6 +469,13 @@ fn merge_arb(
             continue;
         }
         let target_value = target.shift_remove(key);
+        if key.starts_with("@@") {
+            output.insert(
+                key.clone(),
+                target_value.unwrap_or_else(|| source_value.clone()),
+            );
+            continue;
+        }
         if key.starts_with('@') {
             output.insert(key.clone(), source_value.clone());
             continue;
@@ -363,18 +485,22 @@ fn merge_arb(
             .as_str()
             .expect("ARB messages were validated as strings");
         let path = pointer_child("", key);
-        let value = if let Some(translation) = translations.remove(&path) {
+        let value = if source_text.is_empty() {
+            Value::String(String::new())
+        } else if let Some(translation) = translations.remove(&path) {
             Value::String(translation)
         } else if let Some(Value::String(target_text)) = target_value {
             Value::String(target_text)
-        } else if source_text.is_empty() {
-            Value::String(String::new())
         } else {
             return Err(CatalogError::MissingTranslation(path));
         };
         output.insert(key.clone(), value);
     }
-    output.extend(target);
+    for (key, value) in target {
+        if key.starts_with("@@") {
+            output.insert(key, value);
+        }
+    }
     arb::validate_document(&output)?;
     Ok(output)
 }
@@ -479,7 +605,7 @@ mod tests {
         assert_eq!(value["home"], "Home");
         assert_eq!(value["chat"]["list"], "List");
         assert_eq!(value["items"], serde_json::json!(["One", "Two"]));
-        assert_eq!(value["legacy"], "keep");
+        assert!(value.get("legacy").is_none());
     }
 
     #[test]
@@ -563,5 +689,124 @@ mod tests {
         let error = source.merge(None, BTreeMap::new(), "en-US").unwrap_err();
 
         assert!(matches!(error, CatalogError::MissingTranslation(_)));
+    }
+
+    #[test]
+    fn retranslates_only_outdated_source_strings() {
+        let source =
+            Catalog::parse(r#"{"home":"新首页","chat":"聊天"}"#, CatalogFormat::Json).unwrap();
+        let target =
+            Catalog::parse(r#"{"home":"Old home","chat":"Chat"}"#, CatalogFormat::Json).unwrap();
+        let outdated = HashSet::from(["/home"]);
+
+        let diff = source
+            .diff_with_outdated(Some(&target), "en-US", false, &outdated)
+            .unwrap();
+
+        assert_eq!(diff.report.outdated, ["/home"]);
+        assert_eq!(diff.units.len(), 1);
+        assert_eq!(diff.units[0].path, "/home");
+    }
+
+    #[test]
+    fn mirrors_json_structure_and_clears_empty_source_strings() {
+        let source = Catalog::parse(r#"{"title":"","items":["一"]}"#, CatalogFormat::Json).unwrap();
+        let target = Catalog::parse(
+            r#"{"title":"Title","items":["One","Two"],"legacy":"keep"}"#,
+            CatalogFormat::Json,
+        )
+        .unwrap();
+
+        let diff = source.diff(Some(&target), "en-US", false).unwrap();
+        assert_eq!(diff.report.changed, ["/title"]);
+        assert_eq!(diff.report.extra, ["/items/1", "/legacy"]);
+
+        let merged = source
+            .merge(Some(target), BTreeMap::new(), "en-US")
+            .unwrap();
+        let value: Value = serde_json::from_slice(&merged.to_pretty_bytes().unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"title": "", "items": ["One"]}));
+    }
+
+    #[test]
+    fn arb_merge_removes_deleted_messages_and_preserves_global_metadata() {
+        let source = Catalog::parse(
+            r#"{"@@locale":"zh","hello":"你好","@hello":{"description":"问候"}}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+        let target = Catalog::parse(
+            r#"{"@@locale":"en","@@context":"keep","hello":"Hello","@hello":{"description":"old"},"legacy":"Legacy","@legacy":{"description":"remove"}}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+
+        let diff = source.diff(Some(&target), "en", false).unwrap();
+        assert_eq!(diff.report.extra, ["/legacy", "/@legacy"]);
+        let merged = source.merge(Some(target), BTreeMap::new(), "en").unwrap();
+        let value: Value = serde_json::from_slice(&merged.to_pretty_bytes().unwrap()).unwrap();
+
+        assert_eq!(value["@@context"], "keep");
+        assert_eq!(value["hello"], "Hello");
+        assert_eq!(value["@hello"]["description"], "问候");
+        assert!(value.get("legacy").is_none());
+        assert!(value.get("@legacy").is_none());
+    }
+
+    #[test]
+    fn arb_fingerprint_changes_with_description_or_placeholders() {
+        let first = Catalog::parse(
+            r#"{"hello":"你好 {name}","@hello":{"description":"问候","placeholders":{"name":{}}}}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+        let changed_description = Catalog::parse(
+            r#"{"hello":"你好 {name}","@hello":{"description":"正式问候","placeholders":{"name":{}}}}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.source_fingerprints()["/hello"],
+            changed_description.source_fingerprints()["/hello"]
+        );
+    }
+
+    #[test]
+    fn arb_merge_removes_metadata_deleted_from_source_message() {
+        let source = Catalog::parse(r#"{"hello":"你好"}"#, CatalogFormat::Arb).unwrap();
+        let target = Catalog::parse(
+            r#"{"@@locale":"en","hello":"Hello","@hello":{"description":"old"}}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+
+        let diff = source.diff(Some(&target), "en", false).unwrap();
+
+        assert_eq!(diff.report.extra, ["/@hello"]);
+        let merged = source.merge(Some(target), BTreeMap::new(), "en").unwrap();
+        let value: Value = serde_json::from_slice(&merged.to_pretty_bytes().unwrap()).unwrap();
+        assert!(value.get("@hello").is_none());
+    }
+
+    #[test]
+    fn arb_merge_copies_new_source_global_metadata_without_overwriting_target_values() {
+        let source = Catalog::parse(
+            r#"{"@@locale":"zh","@@context":"source","@@new":"copy","hello":"你好"}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+        let target = Catalog::parse(
+            r#"{"@@locale":"en","@@context":"target","hello":"Hello"}"#,
+            CatalogFormat::Arb,
+        )
+        .unwrap();
+
+        let diff = source.diff(Some(&target), "en", false).unwrap();
+        assert_eq!(diff.report.changed, ["/@@new"]);
+        let merged = source.merge(Some(target), BTreeMap::new(), "en").unwrap();
+        let value: Value = serde_json::from_slice(&merged.to_pretty_bytes().unwrap()).unwrap();
+        assert_eq!(value["@@context"], "target");
+        assert_eq!(value["@@new"], "copy");
     }
 }

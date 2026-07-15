@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -6,12 +6,14 @@ use super::{
     CatalogDiff, CatalogError, TranslationKind, TranslationUnit, TypeConflict, path_label,
     pointer_child, value_kind,
 };
+use crate::state::{SourceFingerprints, fingerprint};
 
 pub(super) fn diff(
     source: &Value,
     target: Option<&Value>,
     path: &str,
     force: bool,
+    outdated: &HashSet<&str>,
     catalog_diff: &mut CatalogDiff,
 ) {
     if let Some(target) = target
@@ -35,6 +37,7 @@ pub(super) fn diff(
                     target_map.and_then(|map| map.get(key)),
                     &child_path,
                     force,
+                    outdated,
                     catalog_diff,
                 );
             }
@@ -55,6 +58,7 @@ pub(super) fn diff(
                     target_items.and_then(|items| items.get(index)),
                     &child_path,
                     force,
+                    outdated,
                     catalog_diff,
                 );
             }
@@ -79,6 +83,13 @@ pub(super) fn diff(
             Some(_) if force && !source_text.is_empty() => {
                 push_unit(path, source_text, catalog_diff);
             }
+            Some(_) if outdated.contains(path_or_root(path)) => {
+                catalog_diff.report.outdated.push(path_label(path));
+                push_unit(path, source_text, catalog_diff);
+            }
+            Some(target_text) if source_text.is_empty() && !target_text.is_empty() => {
+                catalog_diff.report.changed.push(path_label(path));
+            }
             Some(_) => {}
         },
         Value::Null | Value::Bool(_) | Value::Number(_) => {
@@ -88,6 +99,28 @@ pub(super) fn diff(
                 catalog_diff.report.changed.push(path_label(path));
             }
         }
+    }
+}
+
+pub(super) fn fingerprints(source: &Value, path: &str, output: &mut SourceFingerprints) {
+    match source {
+        Value::Object(map) => {
+            for (key, value) in map {
+                fingerprints(value, &pointer_child(path, key), output);
+            }
+        }
+        Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                fingerprints(value, &pointer_child(path, &index.to_string()), output);
+            }
+        }
+        Value::String(source) => {
+            output.insert(
+                path_label(path),
+                fingerprint(super::CatalogFormat::Json, source, None, std::iter::empty()),
+            );
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -131,7 +164,6 @@ pub(super) fn merge(
                     merge(source_value, target_value, &child_path, translations)?,
                 );
             }
-            output.extend(target_map);
             Ok(Value::Object(output))
         }
         Value::Array(source_items) => {
@@ -140,7 +172,7 @@ pub(super) fn merge(
                 None => Vec::new(),
                 Some(_) => unreachable!("type conflict was checked above"),
             };
-            let mut output = Vec::with_capacity(source_items.len().max(target_items.len()));
+            let mut output = Vec::with_capacity(source_items.len());
             for (index, source_value) in source_items.iter().enumerate() {
                 let target_value = target_items.get_mut(index).and_then(Option::take);
                 let child_path = pointer_child(path, &index.to_string());
@@ -151,21 +183,26 @@ pub(super) fn merge(
                     translations,
                 )?);
             }
-            output.extend(target_items.into_iter().skip(source_items.len()).flatten());
             Ok(Value::Array(output))
         }
         Value::String(source_text) => {
             let path = path_label(path);
+            if source_text.is_empty() {
+                return Ok(Value::String(String::new()));
+            }
             if let Some(translation) = translations.remove(&path) {
                 return Ok(Value::String(translation));
             }
             match target {
                 Some(Value::String(target_text)) => Ok(Value::String(target_text)),
-                None if source_text.is_empty() => Ok(Value::String(String::new())),
                 None => Err(CatalogError::MissingTranslation(path)),
                 Some(_) => unreachable!("type conflict was checked above"),
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => Ok(source.clone()),
     }
+}
+
+fn path_or_root(path: &str) -> &str {
+    if path.is_empty() { "/" } else { path }
 }

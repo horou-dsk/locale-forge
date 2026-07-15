@@ -5,4 +5,5 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod models;
+pub mod state;
 mod terminal;

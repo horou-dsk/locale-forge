@@ -51,11 +51,12 @@ pub fn context(root: &Map<String, Value>, key: &str) -> ArbContext {
         .and_then(|value| value.get("description"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let placeholders = metadata
+    let mut placeholders: Vec<String> = metadata
         .and_then(|value| value.get("placeholders"))
         .and_then(Value::as_object)
         .map(|value| value.keys().cloned().collect())
         .unwrap_or_default();
+    placeholders.sort();
     ArbContext {
         description,
         placeholders,

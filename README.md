@@ -5,7 +5,8 @@ Locale Forge 是一个 Rust 命令行翻译工具。它读取一个 JSON 或 Flu
 ## 功能
 
 - 递归翻译嵌套 JSON 对象和数组，保留数字、布尔值及 `null`。
-- 默认只翻译缺失或空字符串字段，保留已有译文和额外字段。
+- 通过源文 SHA-256 指纹识别修改字段，仅翻译缺失、空值或过期译文。
+- 目标结构严格跟随源文件，自动清理已删除的 JSON 字段和 ARB 消息元数据。
 - 支持 ARB 元数据、占位符、ICU 复数及 `select` 表达式校验。
 - 每个目标语言独立原子写入；单个语言失败不会破坏原文件。
 - 模型 URL、名称和密钥保存在用户级命名配置中。
@@ -67,11 +68,29 @@ locale-forge --config config.json model activate default
 locale-forge validate
 locale-forge diff
 locale-forge diff --locale en-US --json
+locale-forge state update
+locale-forge state update --locale en-US
 locale-forge translate
 locale-forge translate --locale ja-JP --force
 ```
 
-`diff` 会报告缺失、空值、非字符串结构值变化、额外字段和类型冲突。无差异时返回 `0`，存在差异时返回 `2`；配置或运行错误返回 `1`。`translate` 默认处理所有目标语言，`--force` 会重新翻译全部非空源字符串。
+`diff` 会报告缺失、空值、源文已变更、非字符串结构值变化、额外字段、类型冲突和基线缺失。无差异时返回 `0`，存在差异时返回 `2`；配置或运行错误返回 `1`。`translate` 默认处理所有目标语言，`--force` 会重新翻译全部非空源字符串并重建基线。
+
+## 翻译状态与升级
+
+项目会在 `config.json` 同目录维护 `locale-forge.lock.json`。该文件按目标语言保存字段路径和源文 SHA-256 指纹，不包含源文、译文、模型配置或密钥，建议提交到 Git。每个配置目录只应维护一个此状态文件。
+
+已有目标文件但没有基线时，普通 `translate` 会拒绝猜测译文是否过期。升级现有项目时请选择一种方式：
+
+```powershell
+# 接受当前目标文件，不请求模型也不修改译文
+locale-forge state update
+
+# 或全量重新翻译并建立基线
+locale-forge translate --force
+```
+
+后续修改源字符串或 ARB 的 `description`、占位符名称时，只会重新翻译受影响字段；删除源字段会直接清理目标内容。手工同步了过期译文后，可用 `state update --locale <code>` 接受该语言的当前结果。
 
 翻译进度会输出到标准错误流，包含目标语言、批次、请求次数、字段进度、耗时和重试原因。例如：
 

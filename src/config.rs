@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unic_langid::LanguageIdentifier;
 
-use crate::atomic_file;
+use crate::{atomic_file, state::state_path};
 
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
@@ -80,6 +80,7 @@ impl LoadedProjectConfig {
             .parent()
             .expect("absolute configuration path always has a parent")
             .to_path_buf();
+        reject_reserved_config_path(&config_path, &base_dir)?;
         validate_project_config(&config, &base_dir)?;
         let source_path = normalize_lexically(&base_dir.join(&config.source.path));
 
@@ -136,8 +137,15 @@ pub fn validate_project_config(config: &ProjectConfig, base_dir: &Path) -> Resul
 
     let source_format = extension(&config.source.path)?;
     let source_path = normalize_lexically(&base_dir.join(&config.source.path));
+    let lock_path = normalize_lexically(&state_path(base_dir));
+    if paths_equal(&source_path, &lock_path) {
+        return Err(ConfigError::Invalid(format!(
+            "源文件不能使用保留的状态文件路径 {}",
+            lock_path.display()
+        )));
+    }
     let mut locales = HashSet::new();
-    let mut paths = HashSet::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for target in &config.targets {
         let target_locale = validate_locale("targets[].locale", &target.locale)?;
         if target_locale == source_locale {
@@ -166,26 +174,45 @@ pub fn validate_project_config(config: &ProjectConfig, base_dir: &Path) -> Resul
                 target_path.display()
             )));
         }
-        if target_path == source_path {
+        if paths_equal(&target_path, &source_path) {
             return Err(ConfigError::Invalid(format!(
                 "目标文件 {} 不能覆盖源文件",
                 target_path.display()
             )));
         }
-        if paths.contains(&target_path) {
+        if paths_equal(&target_path, &lock_path) {
+            return Err(ConfigError::Invalid(format!(
+                "目标文件不能使用保留的状态文件路径 {}",
+                lock_path.display()
+            )));
+        }
+        if paths.iter().any(|path| paths_equal(path, &target_path)) {
             return Err(ConfigError::Invalid(format!(
                 "多个目标语言生成了同一路径 {}",
                 target_path.display()
             )));
         }
-        paths.insert(target_path);
+        paths.push(target_path);
     }
 
     Ok(())
 }
 
+#[cfg(windows)]
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
 pub fn write_new_project_config(path: &Path, config: &ProjectConfig) -> Result<(), ConfigError> {
-    validate_project_config(config, path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    reject_reserved_config_path(path, base_dir)?;
+    validate_project_config(config, base_dir)?;
     let contents =
         serde_json::to_string_pretty(config).map_err(|source| ConfigError::Serialize { source })?;
     let mut options = fs::OpenOptions::new();
@@ -201,6 +228,17 @@ pub fn write_new_project_config(path: &Path, config: &ProjectConfig) -> Result<(
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn reject_reserved_config_path(config_path: &Path, base_dir: &Path) -> Result<(), ConfigError> {
+    let lock_path = normalize_lexically(&state_path(base_dir));
+    if paths_equal(&normalize_lexically(config_path), &lock_path) {
+        return Err(ConfigError::Invalid(format!(
+            "配置文件不能使用保留的状态文件路径 {}",
+            lock_path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 原子更新项目配置引用的命名模型配置；值未变化时不写文件。
@@ -502,6 +540,30 @@ mod tests {
         let error = validate_project_config(&config, Path::new(".")).unwrap_err();
 
         assert!(error.to_string().contains("同一路径"));
+    }
+
+    #[test]
+    fn rejects_reserved_state_file_as_source_or_target() {
+        let mut source = valid_config();
+        source.source.path = "locale-forge.lock.json".into();
+        let error = validate_project_config(&source, Path::new(".")).unwrap_err();
+        assert!(error.to_string().contains("保留的状态文件"));
+
+        let mut target = valid_config();
+        target.targets[0].output = Some("locale-forge.lock.json".into());
+        let error = validate_project_config(&target, Path::new(".")).unwrap_err();
+        assert!(error.to_string().contains("保留的状态文件"));
+    }
+
+    #[test]
+    fn rejects_reserved_state_file_as_config_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locale-forge.lock.json");
+
+        let error = write_new_project_config(&path, &valid_config()).unwrap_err();
+
+        assert!(error.to_string().contains("配置文件不能使用"));
+        assert!(!path.exists());
     }
 
     #[test]
